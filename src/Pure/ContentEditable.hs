@@ -1,76 +1,93 @@
-{-# language RankNTypes, ScopedTypeVariables, LambdaCase, BlockArguments, TypeApplications, NamedFieldPuns, MultiParamTypeClasses, OverloadedStrings, ImplicitParams, PatternSynonyms #-}
-module Pure.ContentEditable (ContentEditable(..), contentEditable) where
+{-# language RankNTypes, ScopedTypeVariables, LambdaCase, BlockArguments, TypeApplications, NamedFieldPuns, MultiParamTypeClasses, OverloadedStrings, ImplicitParams, PatternSynonyms, TemplateHaskell, ViewPatterns, TypeFamilies, FlexibleContexts #-}
+module Pure.ContentEditable 
+  ( ContentEditable(..)
+  , asDiv
+  , asP
+  , pattern ContentEditable
+  , pattern OnStartup
+  , pattern OnShutdown
+  ) where
 
-import Pure.Elm hiding (pattern ContentEditable,children,features)
+import Pure.Elm.Component hiding (pattern ContentEditable,children,features,start)
+import Pure.Data.Prop.TH
+import Pure.Data.View (Pure(..))
 
 import Control.Monad (void)
+import Data.Coerce (coerce)
+import Data.Unique (newUnique,hashUnique)
 
-data ContentEditable = ContentEditable
+import Data.IORef (IORef,newIORef,atomicModifyIORef')
+import System.IO.Unsafe (unsafePerformIO)
+
+{-
+This implementation isn't very friendly. If you use this module, prepare to curse it.
+-}
+
+data ContentEditable = ContentEditable_
   { as         :: Features -> [View] -> View
   , children   :: [View]
   , features   :: Features
-  , onStartup  :: ([View] -> IO () -> IO ()) -> IO () 
+  , onStartup  :: ([View] -> (Node -> IO ()) -> IO ()) -> IO () 
   , onShutdown :: IO ()
   }
+deriveLocalComponent ''ContentEditable
 
-instance HasFeatures ContentEditable where
-  getFeatures = features
-  setFeatures fs ce = ce { features = fs }
+asDiv :: Features -> [View] -> View
+asDiv fs cs = Children cs (Features fs Div)
 
-instance HasChildren ContentEditable where
-  getChildren = children
-  setChildren cs ce = ce { children = cs }
+asP :: Features -> [View] -> View
+asP fs cs = Children cs (Features fs P)
 
-data Model = Model
-  { node  :: Node 
-  , write :: (Bool,[View])
-  }
+instance Default ContentEditable where
+  def = ContentEditable_ asDiv def def def def
 
-data Msg = Startup | Host Node | SetContent [View] | Shutdown
+instance Pure ContentEditable where
+  view = run
 
-type Update = Elm Msg => ContentEditable -> Model -> IO Model
+instance Component ContentEditable where
+  data Model ContentEditable = Model
+    { node  :: Node 
+    , write :: (Bool,[View])
+    , ident :: Int
+    }
 
-contentEditable :: ContentEditable -> View
-contentEditable c = run (Applet [Startup] [] [Shutdown] (pure model) upon view) c
-  where model = Model (Node def) (False,children c)
+  initialize ce = do
+    u <- hashUnique <$> newUnique
+    pure (Model (Node def) (False,children ce) u)
 
-upon :: Msg -> Update
-upon = \case
-  Startup      -> startup
-  Host h       -> host h
-  SetContent c -> setContent c
-  Shutdown     -> shutdown
+  data Msg ContentEditable = SetHost Node | SetContent [View] | Shutdown
 
-startup :: Update
-startup ContentEditable { onStartup } mdl = do
-  onStartup (\cnt f -> void (?command (SetContent cnt) f))
-  pure mdl
+  shutdown = [Shutdown]
 
-shutdown :: Update
-shutdown ContentEditable { onShutdown } mdl = do
+  upon = \case
+    SetHost h    -> setHost h
+    SetContent c -> setContent c
+    Shutdown     -> stop
+
+  view ContentEditable_ { as, features, children } Model { node, write = (switch,live), ident } = 
+    -- Use `Tagged @()` as a hack to force full re-renders rather than partial 
+    -- re-renders that aren't aware of the contenteditable nature of the view.
+    -- This update strategy defeats much of the reconciliation optimization that
+    -- Pure.hs tries to accomplish.
+    flip lazy switch $ \_ ->
+      (if switch then Tagged @() else id) $
+        (as features live) 
+          <| Host node (command . SetHost) 
+           . Id ("pure_ce_" <> toTxt ident)
+           . Attribute "contenteditable" "true" 
+
+stop :: Update ContentEditable
+stop ContentEditable_ { onShutdown } mdl = do
   onShutdown
   pure mdl
 
-host :: Node -> Update
-host node _ mdl = 
-  pure mdl 
-    { node = node }
+setHost :: Node -> Update ContentEditable
+setHost node ContentEditable_ { onStartup } mdl@Model { ident } = do
+  onStartup (\cnt f -> void (?command (SetContent cnt) (f node)))
+  pure mdl { node = node }
 
-setContent :: [View] -> Update
+setContent :: [View] -> Update ContentEditable
 setContent p _cfg mdl@Model { write = (switch,_) } = do
   pure mdl
     { write = (Prelude.not switch,p)
     }
-
-type Render = Elm Msg => Model -> View
-
-view :: ContentEditable -> Render 
-view ContentEditable { as, features, children } Model { write = (switch,live) } = 
-  -- Use `Tagged @()` as a hack to force full re-renders rather than partial 
-  -- re-renders that aren't aware of the contenteditable nature of the view.
-  -- This update strategy defeats much of the reconciliation optimization that
-  -- Pure.hs tries to accomplish.
-  (if switch then Tagged @() else id) $
-    (as features live) 
-      <| WithHost (command . Host) 
-       . Attribute "contenteditable" "true" 
