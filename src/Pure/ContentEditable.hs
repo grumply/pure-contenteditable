@@ -83,7 +83,7 @@ stop ContentEditable_ { onShutdown } mdl = do
 
 setHost :: Node -> Update ContentEditable
 setHost node ContentEditable_ { onStartup } mdl@Model { ident } = do
-  onStartup (\cnt f -> void (?command (SetContent cnt) (f node)))
+  onStartup (\cnt f -> commandWith (SetContent cnt) (f node))
   pure mdl { node = node }
 
 setContent :: [View] -> Update ContentEditable
